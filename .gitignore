@@ -1,0 +1,22 @@
+# Secrets and runtime state live in ~/.local/state/opencode-tunnel — never here.
+# These patterns are a safety net in case someone sets OT_STATE_DIR to the repo.
+config
+status.env
+*.pid
+logs/
+*.log
+
+# Local overrides
+.env
+.env.local
+
+# Never commit a generated password
+*password*
+*secret*
+*token*
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

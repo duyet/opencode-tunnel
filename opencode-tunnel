@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# opencode-tunnel — publish a local opencode server over HTTPS via a
+# Cloudflare Quick Tunnel, protected by HTTP Basic auth.
+#
+#   ./opencode-tunnel setup     # check prerequisites, generate credentials
+#   ./opencode-tunnel start     # start server + tunnel, print URL and password
+#   ./opencode-tunnel status    # health check
+#   ./opencode-tunnel url       # print the public URL only
+#   ./opencode-tunnel rotate    # new password, restart
+#   ./opencode-tunnel logs      # tail logs
+#   ./opencode-tunnel stop      # tear everything down
+#
+# Nothing secret is ever written inside the repo: state lives in
+# ${XDG_STATE_HOME:-~/.local/state}/opencode-tunnel with mode 600.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- locations --
+STATE_DIR="${OT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/opencode-tunnel}"
+CONFIG="$STATE_DIR/config"
+STATUS_FILE="$STATE_DIR/status.env"
+LOG_DIR="$STATE_DIR/logs"
+SERVER_LOG="$LOG_DIR/opencode-serve.log"
+TUNNEL_LOG="$LOG_DIR/cloudflared.log"
+SERVER_PID="$STATE_DIR/server.pid"
+TUNNEL_PID="$STATE_DIR/tunnel.pid"
+
+# ------------------------------------------------------------------- config --
+# Capture the environment up front, but do NOT apply defaults yet: assigning
+# here would make the variables non-empty, and load_config's ":-" fallback
+# would then never consult $CONFIG. Precedence is env > config file > default.
+ENV_OC_HOST="${OC_HOST-}"
+ENV_OC_PORT="${OC_PORT-}"
+ENV_OC_DIR="${OC_DIR-}"
+ENV_OC_PASSWORD="${OC_PASSWORD-}"
+OC_BROWSER_VISITS=1          # extra retry budget for DNS propagation
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '  %s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+
+# Read a KEY from $CONFIG without executing it.
+cfg() {
+  [ -f "$CONFIG" ] || return 0
+  local v=""
+  v="$(grep -E "^$1=" "$CONFIG" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  [ -n "$v" ] && printf '%s' "$v"
+}
+
+load_config() {
+  OC_HOST="${ENV_OC_HOST:-$(cfg OC_HOST)}";     OC_HOST="${OC_HOST:-127.0.0.1}"
+  OC_PORT="${ENV_OC_PORT:-$(cfg OC_PORT)}";     OC_PORT="${OC_PORT:-4096}"
+  OC_DIR="${ENV_OC_DIR:-$(cfg OC_DIR)}";        OC_DIR="${OC_DIR:-$PWD}"
+  OC_PASSWORD="${ENV_OC_PASSWORD:-$(cfg OC_PASSWORD)}"
+}
+
+save_config() {
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  umask 077
+  cat >"$CONFIG" <<EOF
+# opencode-tunnel config — mode 600, never commit
+OC_HOST=$OC_HOST
+OC_PORT=$OC_PORT
+OC_DIR=$OC_DIR
+OC_PASSWORD=$OC_PASSWORD
+EOF
+  chmod 600 "$CONFIG"
+}
+
+gen_password() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import secrets;print(secrets.token_urlsafe(32))'
+  else
+    head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 40
+  fi
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found in PATH. $2"; }
+
+# --------------------------------------------------------------- subcommands --
+
+cmd_setup() {
+  load_config
+  step "Checking prerequisites"
+  need opencode  "Install OpenCode: https://opencode.ai"
+  need cloudflared "Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+  need curl "Install curl."
+  info "opencode    $(opencode --version 2>/dev/null | head -1)"
+  info "cloudflared $(cloudflared --version 2>/dev/null | head -1)"
+
+  [ -d "$OC_DIR" ] || die "OC_DIR '$OC_DIR' is not a directory"
+
+  if [ -f "$CONFIG" ]; then
+    info "existing credentials found in $CONFIG (keeping them)"
+  else
+    OC_PASSWORD="${OC_PASSWORD:-$(gen_password)}"
+    save_config
+    info "generated a new password -> $CONFIG (mode 600)"
+  fi
+  step "Setup complete"
+  info "workspace under control: $OC_DIR"
+  info "next: ./opencode-tunnel start"
+}
+
+cmd_start() {
+  load_config
+  [ -n "$OC_PASSWORD" ] || die "no credentials yet. Run: ./opencode-tunnel setup"
+  [ -d "$OC_DIR" ] || die "OC_DIR '$OC_DIR' is not a directory"
+  mkdir -p "$LOG_DIR"; chmod 700 "$STATE_DIR"
+
+  step "Stopping any previous instance"
+  stop_instances
+
+  step "Starting opencode server on $OC_HOST:$OC_PORT"
+  info "OPENCODE_SERVER_PASSWORD enables HTTP Basic auth (user: opencode)"
+  ( cd "$OC_DIR" && OPENCODE_SERVER_PASSWORD="$OC_PASSWORD" \
+      nohup opencode serve --hostname "$OC_HOST" --port "$OC_PORT" \
+      >"$SERVER_LOG" 2>&1 & echo $! >"$SERVER_PID" )
+  sleep 0.3
+  # nohup inside a subshell: the pid we recorded is the subshell's, so resolve
+  # the real tailscale-free child by matching the listening port instead.
+  resolve_server_pid
+
+  local code=""
+  for _ in $(seq 1 80); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      -u "opencode:$OC_PASSWORD" "http://$OC_HOST:$OC_PORT/api/info" || true)
+    [ "$code" = "200" ] && break
+    sleep 0.5
+  done
+  [ "$code" = "200" ] || { die "server did not become healthy (last HTTP $code). See $SERVER_LOG"; }
+  info "healthy (pid $(cat "$SERVER_PID" 2>/dev/null || echo '?'))"
+
+  step "Starting Cloudflare Quick Tunnel"
+  nohup cloudflared tunnel --no-autoupdate --url "http://$OC_HOST:$OC_PORT" \
+    >"$TUNNEL_LOG" 2>&1 &
+  echo $! >"$TUNNEL_PID"
+
+  local URL=""
+  for _ in $(seq 1 80); do
+    URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -1 || true)
+    [ -n "$URL" ] && break
+    sleep 0.5
+  done
+  [ -n "$URL" ] || die "cloudflared did not report a public URL. See $TUNNEL_LOG"
+  info "$URL"
+
+  step "Waiting for the public endpoint to propagate"
+  # A fresh quick-tunnel DNS record is not resolvable immediately; poll until
+  # it answers rather than trusting the first request.
+  local pub="" auth=""
+  for _ in $(seq 1 $((30 * OC_BROWSER_VISITS))); do
+    pub=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/api/info" || true)
+    if [ "$pub" = "401" ]; then
+      auth=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -u "opencode:$OC_PASSWORD" "$URL/api/info" || true)
+      [ "$auth" = "200" ] && break
+    fi
+    sleep 2
+  done
+
+  umask 077
+  cat >"$STATUS_FILE" <<EOF
+OC_URL=$URL
+OC_HOST=$OC_HOST
+OC_PORT=$OC_PORT
+OC_DIR=$OC_DIR
+OC_SERVER_PID=$(cat "$SERVER_PID" 2>/dev/null || echo '')
+OC_TUNNEL_PID=$(cat "$TUNNEL_PID" 2>/dev/null || echo '')
+EOF
+  chmod 600 "$STATUS_FILE"
+
+  step "Result"
+  info "public URL : $URL"
+  info "local      : http://$OC_HOST:$OC_PORT"
+  info "user       : opencode"
+  info "no creds   : HTTP $pub   (expect 401)"
+  info "with creds : HTTP $auth   (expect 200)"
+
+  if [ "$pub" = "401" ] && [ "$auth" = "200" ]; then
+    printf '\n%s\n' "  READY — password (store it safely):"
+    printf '  %s\n\n' "$OC_PASSWORD"
+    info "attach a client with:"
+    printf "    OPENCODE_PASSWORD='%s' opencode --server %s\n\n" "$OC_PASSWORD" "$URL"
+    printf '  curl -u %s:%s %s/api/info\n\n' \
+      "'opencode'" "'$OC_PASSWORD'" "$URL"
+  else
+    die "unexpected auth behaviour ($pub / $auth). Tunnel up but not verified."
+  fi
+}
+
+# The recorded pid may be a wrapper; find the process actually serving the port.
+resolve_server_pid() {
+  local p
+  p=$(ss -lptnH "sport = :$OC_PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
+  if [ -n "$p" ] && [ -d "/proc/$p" ]; then
+    echo "$p" >"$SERVER_PID"
+  fi
+}
+
+stop_instances() {
+  for f in "$TUNNEL_PID" "$SERVER_PID"; do
+    [ -f "$f" ] || continue
+    local p; p=$(cat "$f" 2>/dev/null || true)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      kill "$p" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$p" 2>/dev/null || true
+    fi
+    rm -f "$f"
+  done
+  # belt and braces: no orphaned opencode serve / cloudflared from this state dir
+  pkill -f "opencode serve --hostname $OC_HOST --port $OC_PORT" 2>/dev/null || true
+  sleep 0.5
+}
+
+cmd_stop() {
+  step "Stopping tunnel and server"
+  load_config
+  stop_instances
+  rm -f "$STATUS_FILE"
+  info "stopped. the trycloudflare.com URL is now dead."
+  info "credentials kept in $CONFIG (use ./opencode-tunnel start to reuse)"
+}
+
+cmd_status() {
+  load_config
+  local URL=""; [ -f "$STATUS_FILE" ] && URL=$(grep '^OC_URL=' "$STATUS_FILE" | cut -d= -f2- || true)
+
+  local sp="" tp=""
+  [ -f "$SERVER_PID" ] && sp=$(cat "$SERVER_PID" 2>/dev/null || true)
+  [ -f "$TUNNEL_PID" ] && tp=$(cat "$TUNNEL_PID" 2>/dev/null || true)
+
+  printf '\n  state dir : %s\n' "$STATE_DIR"
+  printf '  workspace : %s\n' "$OC_DIR"
+  printf '  local     : http://%s:%s\n' "$OC_HOST" "$OC_PORT"
+  [ -n "$URL" ] && printf '  public    : %s\n' "$URL"
+  printf '  server pid: %s\n' "${sp:-none}"
+  printf '  tunnel pid: %s\n' "${tp:-none}"
+
+  local lc ac=""
+  lc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    "http://$OC_HOST:$OC_PORT/api/info" || true)
+  printf '  local  /api/info (no creds) : HTTP %s\n' "$lc"
+  if [ -n "$URL" ]; then
+    pc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/api/info" || true)
+    ac=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -u "opencode:$OC_PASSWORD" "$URL/api/info" || true)
+    printf '  public /api/info (no creds) : HTTP %s  (expect 401)\n' "$pc"
+    printf '  public /api/info (creds)   : HTTP %s  (expect 200)\n' "$ac"
+  fi
+  printf '\n'
+}
+
+cmd_url() {
+  [ -f "$STATUS_FILE" ] || die "not started. Run: ./opencode-tunnel start"
+  grep '^OC_URL=' "$STATUS_FILE" | cut -d= -f2-
+}
+
+cmd_rotate() {
+  step "Rotating password"
+  load_config
+  OC_PASSWORD="$(gen_password)"
+  save_config
+  info "new password written to $CONFIG"
+  cmd_start
+}
+
+cmd_logs() {
+  mkdir -p "$LOG_DIR"
+  tail -n 50 -F "$SERVER_LOG" "$TUNNEL_LOG"
+}
+
+case "${1:-}" in
+  setup)  cmd_setup  ;;
+  start)  cmd_start  ;;
+  stop)   cmd_stop   ;;
+  status) cmd_status ;;
+  url)    cmd_url    ;;
+  rotate) cmd_rotate ;;
+  logs)   cmd_logs   ;;
+  *)
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
